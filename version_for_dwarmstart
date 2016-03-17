@@ -1,0 +1,10 @@
+------------------------------------------------
+this is version track for dwarmstart 
+------------------------------------------------
+
+current version : 0317
+last modified : Mar 17, 2016
+content :
+	1. can do wart start or cross validation in 2 ways, with or without load balancing
+	2. output results to file in linear.cpp, not in shell command by '>'
+	
