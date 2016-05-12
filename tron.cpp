@@ -1,69 +1,35 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdarg.h>
+#include <stdlib.h>
 #include <mpi.h>
 #include "tron.h"
+#include "classifier.h"
+#include "mpi_fun.h"
 
-#ifndef min
-template <class T> static inline T min(T x,T y) { return (x<y)?x:y; }
-#endif
 
-#ifndef max
-template <class T> static inline T max(T x,T y) { return (x>y)?x:y; }
-#endif
+using namespace std;
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-extern double dnrm2_(int *, double *, int *);
-extern double ddot_(int *, double *, int *, double *, int *);
-extern int daxpy_(int *, double *, double *, int *, double *, int *);
-extern int dscal_(int *, double *, double *, int *);
-
-#ifdef __cplusplus
-}
-#endif
-
-static int mpi_get_rank()
+extern "C"
 {
-	int rank;
-	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-	return rank;	
+	extern double dnrm2_(int *, double *, int *);
+	extern double ddot_(int *, double *, int *, double *, int *);
+	extern int daxpy_(int *, double *, double *, int *, double *, int *);
+	extern int dscal_(int *, double *, double *, int *);
 }
 
-static void default_print(const char *buf)
+TRON::TRON(classifier *classifier_ptr, double eps, double eps_cg)
 {
-	fputs(buf,stdout);
-	fflush(stdout);
-}
-
-void TRON::info(const char *fmt,...)
-{
-	if(mpi_get_rank()!=0)
-		return;
-	char buf[BUFSIZ];
-	va_list ap;
-	va_start(ap,fmt);
-	vsprintf(buf,fmt,ap);
-	va_end(ap);
-	(*tron_print_string)(buf);
-}
-
-TRON::TRON(const function *fun_obj, double eps, int max_iter)
-{
-	this->fun_obj=const_cast<function *>(fun_obj);
-	this->eps=eps;
-	this->max_iter=max_iter;
-	tron_print_string = default_print;
+	this->classifier_ptr = classifier_ptr;
+	this->eps = eps;
+	this->eps_cg = eps_cg;	
 }
 
 TRON::~TRON()
 {
 }
 
-void TRON::tron(double *w, int turn)
+void TRON::tron(double *w)
 {
 	// Parameters for updating the iterates.
 	double eta0 = 1e-4, eta1 = 0.25, eta2 = 0.75;
@@ -71,49 +37,42 @@ void TRON::tron(double *w, int turn)
 	// Parameters for updating the trust region size delta.
 	double sigma1 = 0.25, sigma2 = 0.5, sigma3 = 4;
 
-	int n = fun_obj->get_nr_variable();
-	int i;
-	double delta, snorm, one=1.0;
+	int n = classifier_ptr->get_nr_variables();
+	int i, cg_iter;
+	double gnorm, gnorm0, delta, snorm, one=1.0;
 	double alpha, f, fnew, prered, actred, gs;
 	int search = 1, iter = 1, inc = 1;
-	double *s = new double[n];
-	double *r = new double[n];
-	double *w_new = new double[n];
-	double *g = new double[n];
+	double *s = (double*)malloc(sizeof(double) * n);
+	double *r = (double*)malloc(sizeof(double) * n);	
+	double *g = (double*)malloc(sizeof(double) * n);
 
 	// calculate gradient norm at w=0 for stopping condition.
-	double *w0 = new double[n];
-	for (i=0; i<n; i++)
-		w0[i] = 0;
-	fun_obj->fun(w0, turn);
-	fun_obj->grad(w0, g, turn);
-	double gnorm0 = dnrm2_(&n, g, &inc);
-	delete [] w0;
-
-	f = fun_obj->fun(w, turn);
-	fun_obj->grad(w, g, turn);
-	delta = dnrm2_(&n, g, &inc);
-	double gnorm = delta;
-
-	if (gnorm <= eps*gnorm0)
+	double *w_new = (double*)malloc(sizeof(double) * n);
+	for (i = 0; i < n; i++)
+		w_new[i] = 0;
+	classifier_ptr->fun(w_new);
+	classifier_ptr->grad(w_new, g);
+	gnorm0 = dnrm2_(&n, g, &inc);	
+	
+	f = classifier_ptr->fun(w);
+	classifier_ptr->grad(w, g);
+	gnorm = dnrm2_(&n, g, &inc);
+	delta = gnorm;
+	
+	if(gnorm <= eps * gnorm0)
 		search = 0;
-
+	
 	iter = 1;
-
-	while (iter <= max_iter && search)
-	{
-		trcg(delta, g, s, r, turn);
-
+	while (iter <= 100 && search)
+	{		
+		cg_iter = trcg(delta, g, s, r);
 		memcpy(w_new, w, sizeof(double)*n);
 		daxpy_(&n, &one, s, &inc, w_new, &inc);
-
 		gs = ddot_(&n, g, &inc, s, &inc);
 		prered = -0.5*(gs-ddot_(&n, s, &inc, r, &inc));
-		fnew = fun_obj->fun(w_new, turn);
-
-		// Compute the actual reduction.
-		actred = f - fnew;
-
+		fnew = classifier_ptr->fun(w_new);		
+		actred = f - fnew;			
+		
 		// On the first iteration, adjust the initial step bound.
 		snorm = dnrm2_(&n, s, &inc);
 		if (iter == 1)
@@ -135,74 +94,82 @@ void TRON::tron(double *w, int turn)
 		else
 			delta = max(delta, min(alpha*snorm, sigma3*delta));
 
-	//	info("iter %2d act %5.3e pre %5.3e delta %5.3e f %5.3e |g| %5.3e CG %3d\n", iter, actred, prered, delta, f, gnorm, cg_iter);
+		if(mpi_get_rank() == 0)
+			fprintf(stderr, "iter %2d eps %g eps_cg %g act %5.3e pre %5.3e delta %5.3e f %5.3e |g| %5.3e |g0| %5.3e CG %3d\n", 
+							iter, eps, eps_cg, actred, prered, delta, f, gnorm, gnorm0, cg_iter);
 
-		if (actred > eta0*prered)
+		if (actred > eta0 * prered)
 		{
 			iter++;
-			memcpy(w, w_new, sizeof(double)*n);
+			memcpy(w, w_new, sizeof(double) * n);	
 			f = fnew;
-			fun_obj->grad(w, g, turn);
+			classifier_ptr->grad(w, g);
 
 			gnorm = dnrm2_(&n, g, &inc);
-			if (gnorm <= eps*gnorm0)
+			if (gnorm <= eps * gnorm0)
 				break;
 		}
+		
 		if (f < -1.0e+32)
 		{
-			info("WARNING: f < -1.0e+32\n");
+			if(mpi_get_rank() == 0)
+				fprintf(stderr, "WARNING: f < -1.0e+32\n");
 			break;
 		}
 		if (fabs(actred) <= 0 && prered <= 0)
 		{
-			info("WARNING: actred and prered <= 0\n");
+			if(mpi_get_rank() == 0)
+				fprintf(stderr, "WARNING: actred and prered <= 0\n");
 			break;
 		}
-		if (fabs(actred) <= 1.0e-12*fabs(f) &&
-		    fabs(prered) <= 1.0e-12*fabs(f))
+		if (fabs(actred) <= 1.0e-12*fabs(f) && fabs(prered) <= 1.0e-12*fabs(f))
 		{
-			info("WARNING: actred and prered too small\n");
+			if(mpi_get_rank() == 0)
+				fprintf(stderr, "WARNING: actred and prered too small\n");
 			break;
 		}
 	}
-
-	delete[] g;
-	delete[] r;
-	delete[] w_new;
-	delete[] s;
+	if(mpi_get_rank() == 0)
+		fprintf(stderr, "Outer iteration : %d, f = %5.3e, |g| = %5.3e\n", iter - 1, f, gnorm);
+	free(g);
+	free(r);
+	free(w_new);
+	free(s);
 }
 
-int TRON::trcg(double delta, double *g, double *s, double *r, int turn)
-{
+int TRON::trcg(double delta, double *g, double *s, double *r)
+{	
 	int i, inc = 1;
-	int n = fun_obj->get_nr_variable();
+	int n = classifier_ptr->get_nr_variables();
 	double one = 1;
-	double *d = new double[n];
-	double *Hd = new double[n];
-	double rTr, rnewTrnew, alpha, beta, cgtol;
-
+	double *d = (double*)malloc(sizeof(double) * n);
+	double *Hd = (double*)malloc(sizeof(double) * n);
+	double rTr, rnewTrnew, alpha, beta, cgtol;	
+	
 	for (i=0; i<n; i++)
 	{
 		s[i] = 0;
 		r[i] = -g[i];
 		d[i] = r[i];
-	}
-	cgtol = 0.1*dnrm2_(&n, g, &inc);
+	}	
+	cgtol = eps_cg * dnrm2_(&n, g, &inc);
 
 	int cg_iter = 0;
 	rTr = ddot_(&n, r, &inc, r, &inc);
 	while (1)
+//	while(cg_iter < 10)	
 	{
 		if (dnrm2_(&n, r, &inc) <= cgtol)
 			break;
 		cg_iter++;
-		fun_obj->Hv(d, Hd, turn);
+		classifier_ptr->Hv(d, Hd);
 
 		alpha = rTr/ddot_(&n, d, &inc, Hd, &inc);
 		daxpy_(&n, &alpha, d, &inc, s, &inc);
 		if (dnrm2_(&n, s, &inc) > delta)
 		{
-		//	info("cg reaches trust region boundary\n");
+		//	if(mpi_get_rank() == 0)
+		//		fprintf(stderr, "cg reaches trust region boundary\n");
 			alpha = -alpha;
 			daxpy_(&n, &alpha, d, &inc, s, &inc);
 
@@ -229,22 +196,9 @@ int TRON::trcg(double delta, double *g, double *s, double *r, int turn)
 		rTr = rnewTrnew;
 	}
 
-	delete[] d;
-	delete[] Hd;
+	free(d);
+	free(Hd);
 
 	return(cg_iter);
 }
 
-double TRON::norm_inf(int n, double *x)
-{
-	double dmax = fabs(x[0]);
-	for (int i=1; i<n; i++)
-		if (fabs(x[i]) >= dmax)
-			dmax = fabs(x[i]);
-	return(dmax);
-}
-
-void TRON::set_print_string(void (*print_string) (const char *buf))
-{
-	tron_print_string = print_string;
-}
